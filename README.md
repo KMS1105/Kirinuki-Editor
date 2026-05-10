@@ -1,6 +1,6 @@
 # Kirinuki-Editor
 
-PANNs (Audio Tagging) 모델: 소리 이벤트를 감지하는 데 사용됩니다.
+## PANNs (Audio Tagging) 모델: 소리 이벤트를 감지하는 데 사용됩니다.
 
 가중치(Cnn14): https://zenodo.org/record/3987831/files/Cnn14_mAP%3D0.431.pth?download=1
 
