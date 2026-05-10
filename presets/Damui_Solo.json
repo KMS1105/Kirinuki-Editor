@@ -1,0 +1,16 @@
+{
+    "interest_events": [
+        "Sigh",
+        "Laughter",
+        "Gasp",
+        "Cough",
+        "Snicker",
+        "Whispering"
+    ],
+    "max_silence_frames": 30,
+    "padding_i": 0.4,
+    "padding_o": 0.6,
+    "threshold": 0.00427,
+    "use_sed": true,
+    "use_whisper": true
+}
