@@ -16,6 +16,6 @@ EEVE-Korean 모델: EEVE-Korean-10.8B:latest (Ollama를 통해 pull 명령어로
 
 Whisper (STT) 모델: 음성 인식을 담당하며, 코드 실행 시 small 또는 base 버전을 자동으로 로드합니다.
 
-FFmpeg (Essentials Build): 영상 인코딩 및 디코딩의 핵심 엔진입니다. (자동)
+FFmpeg (Essentials Build): 영상 인코딩 및 디코딩의 엔진입니다. (자동)
 
 다운로드 링크: https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip
