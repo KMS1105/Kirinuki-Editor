@@ -6,7 +6,7 @@
 
 클래스 라벨(CSV): http://storage.googleapis.com/us_audioset/youtube_corpus/v1/csv/class_labels_indices.csv
 
-===
+---
 
 Ollama (LLM) 관련: 문맥 분석 및 주제 추출에 사용되는 로컬 언어 모델 엔진입니다. (자동)
 
