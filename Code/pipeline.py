@@ -409,7 +409,7 @@ class CutEngine:
 
         prompt = (
             f"당신은 영상 편집을 위한 주제 분석기입니다. 설명이나 서론은 생략하십시오.\n"
-            f"태스크: 아래 스크립트에서 비속어나 거친 표현을 포함하여 영상의 핵심 주제를 10개 단어 내외의 한국어로 요약하세요.\n"
+            f"태스크: 아래 스크립트에서 비속어나 거친 표현을 포함하여 영상의 핵심 주제를 3줄 내외의 한국어로 요약하세요.\n"
             f"규칙: \n"
             f"1. '[AI 분석 주제] 는...' 같은 설명형 문장을 절대 쓰지 마십시오.\n"
             f"2. 오직 분석된 주제 키워드만 출력하십시오.\n"
@@ -683,7 +683,7 @@ class OllamaWorker(QObject):
             self.finished_signal.emit(success)
 
     def _bootstrap_ollama(self):
-        model_name = "EEVE-Korean-10.8B:latest"
+        model_name = "anpigon/eeve-korean-10.8b"
         candidates = [
             os.path.join(PROJECT_ROOT, "AppData", "Local", "Programs", "Ollama", "ollama.exe"),
             shutil.which("ollama"), 
@@ -712,7 +712,7 @@ class OllamaWorker(QObject):
             models = [m['name'] for m in response.json().get('models', [])]
             
             if not any(model_name in m for m in models):
-                self.progress_signal.emit(f"{model_name} 모델이 없어 다운로드를 시작합니다 (약 1.6GB).")
+                self.progress_signal.emit(f"{model_name} 모델이 없어 다운로드를 시작합니다 (약 7.7GB).")
               
                 process = subprocess.Popen(
                     [ollama_bin, "pull", model_name], 
