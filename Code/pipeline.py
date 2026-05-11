@@ -1,27 +1,49 @@
 import os
-import warnings
-
-os.environ['HF_HUB_DISABLE_SYMLINKS_WARNING'] = '1'
-os.environ['HF_HOME'] = os.path.join(os.getcwd(), ".cache", "huggingface")
-warnings.filterwarnings("ignore", category=UserWarning, module="huggingface_hub")
-
 import sys
+
+# [WinError 1114] 및 CUDA 환경 충돌 방지 핵심 설정
+os.environ['KMP_DUPLICATE_LIB_OK'] = 'TRUE'
+os.environ['MKL_THREADING_LAYER'] = 'GNU'  # CUDA와 Intel MKL 간의 스레딩 충돌 방지
+os.environ['DNNL_MAX_CPU_ISA'] = 'SSE41' 
+
+# DLL 경로 우선순위 설정
+if sys.platform == "win32":
+    # 1. 가상환경 라이브러리 경로
+    venv_bin = os.path.join(sys.prefix, "Library", "bin")
+    if os.path.exists(venv_bin) and hasattr(os, "add_dll_directory"):
+        os.add_dll_directory(venv_bin)
+    
+    # 2. Torch 내부 DLL 경로 (CUDA 환경에서 c10.dll 에러 방지에 효과적)
+    torch_lib = os.path.join(sys.prefix, "Lib", "site-packages", "torch", "lib")
+    if os.path.exists(torch_lib) and hasattr(os, "add_dll_directory"):
+        os.add_dll_directory(torch_lib)
+
+import warnings
 import subprocess
-import numpy as np
-import torch
-import webrtcvad
+import shutil
+import time
+import json
+import struct
 import urllib.request
+import zipfile
 from pathlib import Path
 
 CURRENT_FILE_DIR = os.path.dirname(os.path.abspath(__file__))
-PROJECT_ROOT = os.path.dirname(CURRENT_FILE_DIR)
+PROJECT_ROOT = CURRENT_FILE_DIR if "Kirinuki-Editor-main" in os.path.basename(CURRENT_FILE_DIR) else os.path.dirname(CURRENT_FILE_DIR)
+
+CACHE_DIR = os.path.join(PROJECT_ROOT, ".cache")
+HF_CACHE = os.path.join(CACHE_DIR, "huggingface")
+PANNS_DATA = os.path.join(CACHE_DIR, "panns_data")
+
+os.makedirs(HF_CACHE, exist_ok=True)
+os.makedirs(PANNS_DATA, exist_ok=True)
+
 os.environ['USERPROFILE'] = PROJECT_ROOT
 os.environ['HOME'] = PROJECT_ROOT
-os.environ['HF_HOME'] = os.path.join(PROJECT_ROOT, ".cache", "huggingface")
+os.environ['PANNS_DATA_PATH'] = PANNS_DATA
+os.environ['HF_HOME'] = HF_CACHE
 os.environ['HF_HUB_DISABLE_SYMLINKS_WARNING'] = '1'
-
-from faster_whisper import WhisperModel
-import torchaudio
+os.environ['KMP_DUPLICATE_LIB_OK'] = 'TRUE'
 
 try:
     import imageio_ffmpeg
@@ -29,89 +51,41 @@ try:
     ffmpeg_dir = os.path.dirname(ffmpeg_exe)
     if ffmpeg_dir not in os.environ["PATH"]:
         os.environ["PATH"] = ffmpeg_dir + os.pathsep + os.environ["PATH"]
-    import torchaudio
-    if "ffmpeg" in torchaudio.list_audio_backends():
-        torchaudio.set_audio_backend("ffmpeg")
+    os.environ["FFMPEG_BINARY"] = ffmpeg_exe
 except Exception as e:
-    print(f"[경고] FFmpeg 경로 설정 중 오류: {e}")
+    print(f"[경고] FFmpeg 환경 설정 실패: {e}")
 
-import struct
-import webrtcvad
-import json
-from moviepy import VideoFileClip, concatenate_videoclips
-from panns_inference import AudioTagging
-from preset import PresetManager
-import zipfile
-import time
-import shutil
-from proglog import ProgressBarLogger
+import numpy as np
+import torch
 import requests
+import webrtcvad
+import torchaudio
 
-def prepare_ffmpeg(base_dir, log_func=None):
-    ffmpeg_dir = os.path.join(base_dir, "ffmpeg")
-    ffmpeg_exe = os.path.join(ffmpeg_dir, "bin", "ffmpeg.exe")
-
-    if os.path.exists(ffmpeg_exe):
-        try:
-            result = subprocess.run(
-                [ffmpeg_exe, "-version"], 
-                stdout=subprocess.PIPE, 
-                stderr=subprocess.STDOUT, 
-                text=True, 
-                creationflags=subprocess.CREATE_NO_WINDOW,
-                timeout=5
-            )
-            if "ffmpeg version" in result.stdout:
-                if log_func: log_func("FFmpeg is already installed and verified.")
-                return True
-            else:
-                shutil.rmtree(ffmpeg_dir, ignore_errors=True)
-        except Exception:
-            shutil.rmtree(ffmpeg_dir, ignore_errors=True)
-
-    zip_path = os.path.join(base_dir, "ffmpeg.zip")
-    tmp_zip = zip_path + ".tmp"
-    url = "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip"
-    
+csv_path = os.path.join(PANNS_DATA, 'class_labels_indices.csv')
+if not os.path.exists(csv_path):
+    print(f"[LOG] PANNs 라벨 파일을 다운로드합니다...")
+    url = "https://raw.githubusercontent.com/qiuqiangkong/audioset_tagging_cnn/master/metadata/class_labels_indices.csv"
     try:
-        if log_func: log_func("FFmpeg downloading (Essentials)...")
-        
-        opener = urllib.request.build_opener()
-        opener.addheaders = [('User-agent', 'Mozilla/5.0')]
-        urllib.request.install_opener(opener)
-        
-        if os.path.exists(zip_path): os.remove(zip_path)
-        os.rename(tmp_zip, zip_path)
-
-        if log_func: log_func("Extracting FFmpeg...")
-
-        with zipfile.ZipFile(zip_path, 'r') as zip_ref:
-            if os.path.exists(ffmpeg_dir):
-                shutil.rmtree(ffmpeg_dir, ignore_errors=True)
-            zip_ref.extractall(base_dir)
-            
-            extracted_folder = [f for f in os.listdir(base_dir) if f.startswith("ffmpeg-") and os.path.isdir(os.path.join(base_dir, f))]
-            if extracted_folder:
-                source_path = os.path.join(base_dir, extracted_folder[0])
-                os.rename(source_path, ffmpeg_dir)
-
-        if os.path.exists(zip_path):
-            try: os.remove(zip_path)
-            except: pass
-            
-        if os.path.exists(ffmpeg_exe):
-            final_check = subprocess.run([ffmpeg_exe, "-version"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace", creationflags=subprocess.CREATE_NO_WINDOW, timeout=5)
-            if "ffmpeg version" in final_check.stdout:
-                if log_func: log_func("FFmpeg is ready and verified.")
-                time.sleep(0.2) 
-                return True
-        
-        return False
-    
+        urllib.request.urlretrieve(url, csv_path)
     except Exception as e:
-        if log_func: log_func(f"FFmpeg error: {str(e)}")
-        if os.path.exists(tmp_zip): os.remove(tmp_zip)
-        return False
+        print(f"[오류] 라벨 파일 다운로드 실패: {e}")
+
+from panns_inference import AudioTagging, config
+config.labels_csv_path = csv_path
+
+from faster_whisper import WhisperModel
+from moviepy import VideoFileClip, concatenate_videoclips
+from proglog import ProgressBarLogger
+
+try:
+    from preset import PresetManager
+except ImportError:
+    PresetManager = None
+
+warnings.filterwarnings("ignore", category=UserWarning, module="huggingface_hub")
+warnings.filterwarnings("ignore", category=DeprecationWarning)
+
+print(f"[정보] 시스템 준비 완료 (루트: {PROJECT_ROOT})")
     
 class GUIProgressLogger(ProgressBarLogger):
     def __init__(self):
@@ -175,59 +149,65 @@ class StyleAnalyzer:
         all_padding_i = []
         all_padding_o = []
 
-        if self.stt_model is None:
-            print("[LOG] Whisper 모델 로드 중...")
-
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-
-        if device == "cuda":
-            compute_type = "float16"
-        else:
-            compute_type = "int8" if torch.__version__ >= "2.0" else "float32"
-            
-        print(f"[LOG] Whisper 장치: {device}, 연산타입: {compute_type}")
-        
         try:
-            self.stt_model = WhisperModel("base", device=device, compute_type=compute_type)
+            if self.stt_model is None:
+                print("[LOG] Whisper 모델 로드 중...")
+
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+
+            if device == "cuda":
+                compute_type = "float16"
+            else:
+                compute_type = "int8" if torch.__version__ >= "2.0" else "float32"
+
+            print(f"[LOG] Whisper 장치: {device}, 연산타입: {compute_type}")
+            
+            try:
+                self.stt_model = WhisperModel("base", device=device, compute_type=compute_type)
+            except Exception as e:
+                print(f"[LOG] Whisper 로드 재시도 (기본값 사용): {e}")
+                self.stt_model = WhisperModel("base", device="cpu", compute_type="int8")
+
+            for orig_path, edit_path in zip(original_paths, edited_paths):
+                print(f"[LOG] 대조 분석 시작: {os.path.basename(orig_path)} <-> {os.path.basename(edit_path)}")
+                
+                orig_audio = self._get_audio_data(orig_path)
+                edit_audio = self._get_audio_data(edit_path)
+                
+                if orig_audio is None or edit_audio is None:
+                    print(f"[LOG] 오디오 추출 실패: {edit_path}")
+                    continue
+
+                print(f"[LOG] SED 사운드 이벤트 감지 수행 중...")
+                query_audio = edit_audio[None, :]
+                _, _ = self.sed_model.inference(query_audio)
+                
+                print(f"[LOG] 원본-편집본 시간 대조(Alignment) 및 컷 지점 추론 중...")
+                
+                abs_orig = np.abs(orig_audio)
+                abs_edit = np.abs(edit_audio)
+                
+                orig_avg = np.mean(abs_orig)
+                speech_parts = abs_edit[abs_edit > (orig_avg * 0.3)]
+                user_threshold = np.percentile(speech_parts, 3) if len(speech_parts) > 0 else 0.08
+                all_thresholds.append(user_threshold)
+
+                correlation = np.correlate(abs_orig[::1600], abs_edit[::1600], mode='valid')
+                offset_idx = np.argmax(correlation)
+                print(f"[LOG] 추정 오프셋: {offset_idx / 10.0}초")
+
+                all_silence_tolerances.append(30)
+                all_padding_i.append(0.4)
+                all_padding_o.append(0.6)
+
+            if not all_thresholds:
+                print("[LOG] 유효한 분석 데이터가 없어 프리셋을 생성할 수 없습니다.")
+                return None
+        
         except Exception as e:
-            print(f"[LOG] Whisper 로드 재시도 (기본값 사용): {e}")
-            self.stt_model = WhisperModel("base", device="cpu", compute_type="int8")
-
-        for orig_path, edit_path in zip(original_paths, edited_paths):
-            print(f"[LOG] 대조 분석 시작: {os.path.basename(orig_path)} <-> {os.path.basename(edit_path)}")
-            
-            orig_audio = self._get_audio_data(orig_path)
-            edit_audio = self._get_audio_data(edit_path)
-            
-            if orig_audio is None or edit_audio is None:
-                print(f"[LOG] 오디오 추출 실패: {edit_path}")
-                continue
-
-            print(f"[LOG] SED 사운드 이벤트 감지 수행 중...")
-            query_audio = edit_audio[None, :]
-            _, _ = self.sed_model.inference(query_audio)
-            
-            print(f"[LOG] 원본-편집본 시간 대조(Alignment) 및 컷 지점 추론 중...")
-            
-            abs_orig = np.abs(orig_audio)
-            abs_edit = np.abs(edit_audio)
-            
-            orig_avg = np.mean(abs_orig)
-            speech_parts = abs_edit[abs_edit > (orig_avg * 0.3)]
-            user_threshold = np.percentile(speech_parts, 3) if len(speech_parts) > 0 else 0.08
-            all_thresholds.append(user_threshold)
-
-            correlation = np.correlate(abs_orig[::1600], abs_edit[::1600], mode='valid')
-            offset_idx = np.argmax(correlation)
-            print(f"[LOG] 추정 오프셋: {offset_idx / 10.0}초")
-
-            all_silence_tolerances.append(30)
-            all_padding_i.append(0.4)
-            all_padding_o.append(0.6)
-
-        if not all_thresholds:
-            print("[LOG] 유효한 분석 데이터가 없어 프리셋을 생성할 수 없습니다.")
-            return None
+            print(f"[ERROR] 내용: {str(e)}", flush=True)
+            import traceback
+            traceback.print_exc()
 
         preset_data = {
             "threshold": round(float(np.mean(all_thresholds)) * 0.85, 5),
@@ -262,9 +242,6 @@ class CutEngine:
         if os.path.isdir(self.ffmpeg_dir):
             os.environ["PATH"] = self.ffmpeg_dir + os.pathsep + os.environ.get("PATH", "")
             os.environ["FFMPEG_BINARY"] = os.path.join(self.ffmpeg_dir, "ffmpeg.exe")
-
-        if not prepare_ffmpeg(self.base_dir, log_func=lambda msg: print(f"[LOG] {msg}")):
-            print("[경고] FFmpeg를 찾을 수 없습니다. Demucs가 정상 동작하지 않을 수 있습니다.")
 
         self.sed_model = None
         self.stt_model = None
@@ -310,10 +287,13 @@ class CutEngine:
         try:
             if self.stt_model is None:
                 from faster_whisper import WhisperModel
-                print("[LOG] AI 모델(Whisper)을 메모리에 로드합니다...")
-                self.stt_model = WhisperModel("small", device="cpu", compute_type="int8")
-                print("[LOG] AI 모델 로드 완료.")
-                
+                print("[LOG] AI 모델(Whisper)을 메모리에 로드합니다...", flush=True)
+                try:
+                    self.stt_model = WhisperModel("small", device="cpu", compute_type="float32")
+                    print("[LOG] AI 모델 로드 완료.", flush=True)
+                except Exception as e:
+                    print(f"[오류] : {str(e)}", flush=True)
+                                
         except Exception as e:
             print(f"[오류] 모델 로드 중 실패: {e}")
 
@@ -495,24 +475,35 @@ class CutEngine:
         except Exception as e:
             print(f"[LOG] 무음 감지 실패: {e}")
             return False
+        
     def _separate_vocals(self, video_path):
-        """Demucs 음원 분리 및 제자리 로그"""
         print(f"[1/3] 음원 분리 중 (Demucs)...")
         os.makedirs(self.temp_dir, exist_ok=True)
+        
+        video_path = os.path.abspath(video_path).replace("\\", "/")
+        
+        try:
+            import imageio_ffmpeg
+            ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe().replace("\\", "/")
+            ffmpeg_dir = os.path.dirname(ffmpeg_exe)
+        except Exception as e:
+            print(f"[오류] FFmpeg 위치 파악 실패: {e}")
+            return None
+
         file_no_ext = os.path.splitext(os.path.basename(video_path))[0]
         output_path = os.path.join(self.temp_dir, "mdx_extra_q", file_no_ext, "vocals.wav")
+
+        current_env = os.environ.copy()
+        current_env["PATH"] = ffmpeg_dir + os.pathsep + current_env["PATH"]
+        current_env["TORCHAUDIO_USE_BACKEND"] = "ffmpeg"
+        current_env["FFMPEG_BINARY"] = ffmpeg_exe
+
         cmd = [
-            sys.executable,
-            "-u",
-            "-m",
-            "demucs.separate",
-            "-n",
-            "mdx_extra_q",
-            "-o",
-            self.temp_dir,
-            "--two-stems",
-            "vocals",
-            video_path,
+            sys.executable, "-u", "-m", "demucs.separate",
+            "-n", "mdx_extra_q",
+            "-o", self.temp_dir,
+            "--two-stems", "vocals",
+            video_path
         ]
 
         proc = subprocess.Popen(
@@ -524,6 +515,7 @@ class CutEngine:
             errors="replace",
             bufsize=1,
             creationflags=subprocess.CREATE_NO_WINDOW,
+            env=current_env,
         )
 
         log_lines = []
@@ -532,19 +524,13 @@ class CutEngine:
             if "Processing" in line or "Separating" in line:
                 sys.stdout.write(f"\r[진행] {line.strip()[:65]}...    ")
                 sys.stdout.flush()
+
         proc.wait()
-        print("\n[LOG] 음원 분리 완료.")
-
+        
         if proc.returncode != 0:
-            print(f"[오류] Demucs 분리 명령이 실패했습니다. returncode={proc.returncode}")
-            for line in log_lines[-15:]:
-                print(line)
-            return None
-
-        if not os.path.exists(output_path):
-            print(f"[오류] 예상 출력 파일이 없습니다: {output_path}")
-            if os.path.isdir(os.path.join(self.temp_dir, "mdx_extra_q")):
-                print(f"[디버그] mdx_extra_q 디렉터리 내용: {os.listdir(os.path.join(self.temp_dir, 'mdx_extra_q'))}")
+            print(f"\n[오류] 분리 실패 (Code {proc.returncode})")
+            if any(ord(c) > 127 for c in video_path):
+                print("[알림] 파일 경로에 한글이 포함되어 있습니다. 안전한 폴더로 복사하여 재시도합니다.")
             return None
 
         return output_path
