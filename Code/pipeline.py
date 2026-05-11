@@ -1,22 +1,17 @@
 import os
 import sys
 
-# [WinError 1114] 및 CUDA 환경 충돌 방지 핵심 설정
 os.environ['KMP_DUPLICATE_LIB_OK'] = 'TRUE'
-os.environ['MKL_THREADING_LAYER'] = 'GNU'  # CUDA와 Intel MKL 간의 스레딩 충돌 방지
-os.environ['DNNL_MAX_CPU_ISA'] = 'SSE41' 
+os.environ['MKL_THREADING_LAYER'] = 'GNU'
 
-# DLL 경로 우선순위 설정
 if sys.platform == "win32":
-    # 1. 가상환경 라이브러리 경로
-    venv_bin = os.path.join(sys.prefix, "Library", "bin")
-    if os.path.exists(venv_bin) and hasattr(os, "add_dll_directory"):
-        os.add_dll_directory(venv_bin)
+    venv_path = os.path.join(os.path.dirname(sys.executable), "Library", "bin")
+    torch_lib_path = os.path.join(os.path.dirname(sys.executable), "Lib", "site-packages", "torch", "lib")
     
-    # 2. Torch 내부 DLL 경로 (CUDA 환경에서 c10.dll 에러 방지에 효과적)
-    torch_lib = os.path.join(sys.prefix, "Lib", "site-packages", "torch", "lib")
-    if os.path.exists(torch_lib) and hasattr(os, "add_dll_directory"):
-        os.add_dll_directory(torch_lib)
+    if os.path.exists(venv_path):
+        os.add_dll_directory(venv_path)
+    if os.path.exists(torch_lib_path):
+        os.add_dll_directory(torch_lib_path)
 
 import warnings
 import subprocess
@@ -28,8 +23,18 @@ import urllib.request
 import zipfile
 from pathlib import Path
 
+os.environ['KMP_DUPLICATE_LIB_OK'] = 'TRUE'
+os.environ['MKL_THREADING_LAYER'] = 'GNU'
+os.environ['DNNL_MAX_CPU_ISA'] = 'SSE41'
+
+if sys.platform == "win32":
+    for path in [os.path.join(sys.prefix, "Library", "bin"), 
+                 os.path.join(sys.prefix, "Lib", "site-packages", "torch", "lib")]:
+        if os.path.exists(path) and hasattr(os, "add_dll_directory"):
+            os.add_dll_directory(path)
+
 CURRENT_FILE_DIR = os.path.dirname(os.path.abspath(__file__))
-PROJECT_ROOT = CURRENT_FILE_DIR if "Kirinuki-Editor-main" in os.path.basename(CURRENT_FILE_DIR) else os.path.dirname(CURRENT_FILE_DIR)
+PROJECT_ROOT = os.path.dirname(CURRENT_FILE_DIR) 
 
 CACHE_DIR = os.path.join(PROJECT_ROOT, ".cache")
 HF_CACHE = os.path.join(CACHE_DIR, "huggingface")
@@ -43,7 +48,6 @@ os.environ['HOME'] = PROJECT_ROOT
 os.environ['PANNS_DATA_PATH'] = PANNS_DATA
 os.environ['HF_HOME'] = HF_CACHE
 os.environ['HF_HUB_DISABLE_SYMLINKS_WARNING'] = '1'
-os.environ['KMP_DUPLICATE_LIB_OK'] = 'TRUE'
 
 try:
     import imageio_ffmpeg
@@ -53,26 +57,22 @@ try:
         os.environ["PATH"] = ffmpeg_dir + os.pathsep + os.environ["PATH"]
     os.environ["FFMPEG_BINARY"] = ffmpeg_exe
 except Exception as e:
-    print(f"[경고] FFmpeg 환경 설정 실패: {e}")
+    print(f"[경고] FFmpeg 설정 실패: {e}")
 
 import numpy as np
 import torch
 import requests
 import webrtcvad
-import torchaudio
 
 csv_path = os.path.join(PANNS_DATA, 'class_labels_indices.csv')
 if not os.path.exists(csv_path):
-    print(f"[LOG] PANNs 라벨 파일을 다운로드합니다...")
+    print("[LOG] PANNs 라벨 다운로드 중...")
     url = "https://raw.githubusercontent.com/qiuqiangkong/audioset_tagging_cnn/master/metadata/class_labels_indices.csv"
-    try:
-        urllib.request.urlretrieve(url, csv_path)
-    except Exception as e:
-        print(f"[오류] 라벨 파일 다운로드 실패: {e}")
+    try: urllib.request.urlretrieve(url, csv_path)
+    except: print("[오류] 라벨 다운로드 실패")
 
 from panns_inference import AudioTagging, config
 config.labels_csv_path = csv_path
-
 from faster_whisper import WhisperModel
 from moviepy import VideoFileClip, concatenate_videoclips
 from proglog import ProgressBarLogger
@@ -83,9 +83,7 @@ except ImportError:
     PresetManager = None
 
 warnings.filterwarnings("ignore", category=UserWarning, module="huggingface_hub")
-warnings.filterwarnings("ignore", category=DeprecationWarning)
-
-print(f"[정보] 시스템 준비 완료 (루트: {PROJECT_ROOT})")
+print(f"[정보] 준비 완료: {PROJECT_ROOT}")
     
 class GUIProgressLogger(ProgressBarLogger):
     def __init__(self):
@@ -480,8 +478,17 @@ class CutEngine:
         print(f"[1/3] 음원 분리 중 (Demucs)...")
         os.makedirs(self.temp_dir, exist_ok=True)
         
-        video_path = os.path.abspath(video_path).replace("\\", "/")
+        is_unsafe = any(ord(c) > 127 for c in video_path) or " " in os.path.basename(video_path)
         
+        if is_unsafe:
+            temp_name = f"temp_in_{int(time.time())}.mp4"
+            safe_video_path = os.path.join(self.temp_dir, temp_name).replace("\\", "/")
+            shutil.copy2(video_path, safe_video_path)
+            video_path = safe_video_path
+            print(f"[알림] 경로 호환성을 위해 임시 파일을 생성했습니다.")
+        else:
+            video_path = os.path.abspath(video_path).replace("\\", "/")
+
         try:
             import imageio_ffmpeg
             ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe().replace("\\", "/")
@@ -518,19 +525,23 @@ class CutEngine:
             env=current_env,
         )
 
-        log_lines = []
         for line in proc.stdout:
-            log_lines.append(line.rstrip())
             if "Processing" in line or "Separating" in line:
                 sys.stdout.write(f"\r[진행] {line.strip()[:65]}...    ")
                 sys.stdout.flush()
 
         proc.wait()
         
+        if is_unsafe and os.path.exists(video_path):
+            try: os.remove(video_path)
+            except: pass
+
         if proc.returncode != 0:
             print(f"\n[오류] 분리 실패 (Code {proc.returncode})")
-            if any(ord(c) > 127 for c in video_path):
-                print("[알림] 파일 경로에 한글이 포함되어 있습니다. 안전한 폴더로 복사하여 재시도합니다.")
+            return None
+
+        if not os.path.exists(output_path):
+            print(f"\n[오류] 결과 파일이 생성되지 않았습니다: {output_path}")
             return None
 
         return output_path
