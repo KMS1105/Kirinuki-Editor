@@ -1,6 +1,8 @@
 import os
 import warnings
 
+import psutil
+
 os.environ['HF_HUB_DISABLE_SYMLINKS_WARNING'] = '1'
 os.environ['HF_HOME'] = os.path.join(os.getcwd(), ".cache", "huggingface")
 warnings.filterwarnings("ignore", category=UserWarning, module="huggingface_hub")
@@ -117,37 +119,27 @@ class GUIProgressLogger(ProgressBarLogger):
     def __init__(self):
         super().__init__()
         self.last_pct = -1
-
+        
     def callback(self, **kw):
         if not self.state.get('bars'): return
-
         bar = list(self.state['bars'].values())[-1]
-        
         if bar['total'] > 0:
             pct = int(bar['index'] / bar['total'] * 100)
-            
             if pct > self.last_pct:
-                print(f"[렌더링 진행] {pct}% 완료...")
+                print(f"\r[렌더링 진행] {pct}% 완료...")
                 self.last_pct = pct
 
 class StyleAnalyzer:
     def __init__(self, ffmpeg_bin_path=None):
-        print("[LOG] StyleAnalyzer 초기화 중...")
         self.vad = webrtcvad.Vad(3)
         self.sample_rate = 16000
         self.pm = PresetManager()
         self.ffmpeg_bin_path = ffmpeg_bin_path
         self.stt_model = None
-        self.sed_model = None
-        
-        print("[LOG] SED 모델 로드 중...")
-        
         try:
             self.sed_model = AudioTagging(checkpoint_path=None, device='cuda' if torch.cuda.is_available() else 'cpu')
-        except Exception as e:
-            print(f"[LOG] SED 로드 실패: {e}")
+        except:
             self.sed_model = None
-            
         self.interest_events = ['Sigh', 'Laughter', 'Gasp', 'Cough', 'Snicker', 'Whispering']
         
     def _get_ffmpeg_path(self):
@@ -177,21 +169,19 @@ class StyleAnalyzer:
 
         if self.stt_model is None:
             print("[LOG] Whisper 모델 로드 중...")
-
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-
-        if device == "cuda":
-            compute_type = "float16"
-        else:
-            compute_type = "int8" if torch.__version__ >= "2.0" else "float32"
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+            if device == "cuda":
+                compute_type = "float16"
+            else:
+                compute_type = "int8" if torch.__version__ >= "2.0" else "float32"
+                
+            print(f"[LOG] Whisper 장치: {device}, 연산타입: {compute_type}")
             
-        print(f"[LOG] Whisper 장치: {device}, 연산타입: {compute_type}")
-        
-        try:
-            self.stt_model = WhisperModel("base", device=device, compute_type=compute_type)
-        except Exception as e:
-            print(f"[LOG] Whisper 로드 재시도 (기본값 사용): {e}")
-            self.stt_model = WhisperModel("base", device="cpu", compute_type="int8")
+            try:
+                self.stt_model = WhisperModel("base", device=device, compute_type=compute_type)
+            except Exception as e:
+                print(f"[LOG] Whisper 로드 재시도 (기본값 사용): {e}")
+                self.stt_model = WhisperModel("base", device="cpu", compute_type="int8")
 
         for orig_path, edit_path in zip(original_paths, edited_paths):
             print(f"[LOG] 대조 분석 시작: {os.path.basename(orig_path)} <-> {os.path.basename(edit_path)}")
@@ -310,15 +300,25 @@ class CutEngine:
         try:
             if self.stt_model is None:
                 from faster_whisper import WhisperModel
-                print("[LOG] AI 모델(Whisper)을 메모리에 로드합니다...")
-                self.stt_model = WhisperModel("small", device="cpu", compute_type="int8")
-                print("[LOG] AI 모델 로드 완료.")
+                print("[LOG] Whisper를 메모리에 로드합니다...")
                 
+                device = "cuda" if torch.cuda.is_available() else "cpu"
+                compute_type = "float16" if device == "cuda" else "int8"
+                
+                print(f"[LOG] Whisper 환경 설정 - Device: {device}, Compute: {compute_type}")
+                
+                self.stt_model = WhisperModel("small", device=device, compute_type=compute_type)
+                print("[LOG] Whisper 로드 완료.")
+                    
         except Exception as e:
             print(f"[오류] 모델 로드 중 실패: {e}")
+            try:
+                self.stt_model = WhisperModel("small", device="cpu", compute_type="int8")
+            except:
+                pass
 
     def _ollama_model_id(self):
-        return "llama3.2:3b"
+        return "anpigon/eeve-korean-10.8b"
 
     def _ollama_cli_path(self):
         candidates = [
@@ -338,8 +338,6 @@ class CutEngine:
             "run",
             self._ollama_model_id(),
             prompt,
-            "--format",
-            "json",
             "--nowordwrap",
         ]
 
@@ -386,7 +384,15 @@ class CutEngine:
             try:
                 res = requests.post(
                     url,
-                    json={"model": self._ollama_model_id(), "prompt": prompt, "stream": False},
+                    json={
+                        "model": self._ollama_model_id(),
+                        "prompt": prompt,
+                        "stream": False,
+                        "options": {
+                            "temperature": 0.7,
+                            "top_p": 0.9
+                        }
+                    },
                     timeout=timeout,
                 )
                 if res.status_code == 200:
@@ -408,17 +414,17 @@ class CutEngine:
             return "General"
 
         prompt = (
-            f"당신은 영상 편집을 위한 주제 분석기입니다. 설명이나 서론은 생략하십시오.\n"
-            f"태스크: 아래 스크립트에서 비속어나 거친 표현을 포함하여 영상의 핵심 주제를 3줄 내외의 한국어로 요약하세요.\n"
-            f"규칙: \n"
-            f"1. '[AI 분석 주제] 는...' 같은 설명형 문장을 절대 쓰지 마십시오.\n"
-            f"2. 오직 분석된 주제 키워드만 출력하십시오.\n"
-            f"3. 비속어가 있다면 그 특징을 살려 '격한 반응', '거친 담화' 등으로 표현하십시오.\n\n"
+            f"영상의 스크립트를 분석하여 핵심 키워드 10~20개를 추출하세요.\n"
+            f"규칙:\n"
+            f"1. 설명이나 인사말 없이 오직 키워드만 쉼표(,)로 구분하여 나열하십시오.\n"
+            f"2. 주제, 등장인물, 주요 사건, 감정 상태를 모두 포함하세요.\n"
+            f"3. 비속어나 거친 표현이 있다면 순화하지 말고 그 분위기를 살린 키워드로 만드세요.\n"
+            f"4. 반드시 10개 이상의 키워드를 생성하세요.\n\n"
             f"스크립트: {full_text[:1500]}\n\n"
-            f"결과(주제 키워드만):"
+            f"결과(키워드만):"
         )
 
-        response = self._ollama_request(prompt, timeout=30)
+        response = self._ollama_request(prompt, timeout=300)
         if response:
             topic = str(response).strip()
             if topic:
@@ -433,21 +439,28 @@ class CutEngine:
             return True
 
         prompt = (
-            f"주제: {topic}\n"
-            f"문장: {text}\n"
-            f"위 문장이 설정된 주제와 맥락상 관련이 있거나, 영상의 재미를 위해 유지해야 하는 구간인가요? "
-            f"비속어가 포함되어 있어도 재미있거나 맥락상 필요하다면 유지하세요.\n"
-            f"반드시 'Y' 또는 'N'으로만 대답하세요."
+            f"당신은 영상 편집 전문가입니다. 아래 규칙에 따라 문장의 유지 여부를 판단하세요.\n\n"
+            f"[분석 주제 키워드]: {topic}\n"
+            f"[대상 문장]: \"{text}\"\n\n"
+            f"규칙:\n"
+            f"1. 문장에 [분석 주제 키워드] 중 하나라도 포함되어 있다면 반드시 'Y'를 출력하세요.\n"
+            f"2. 키워드가 직접 없더라도, 주제와 관련된 대화나 리액션(웃음, 감탄 등)이면 'Y'를 출력하세요.\n"
+            f"3. 비속어가 섞여 있거나 문장이 완벽하지 않아도 맥락상 재미있다면 'Y'를 출력하세요.\n"
+            f"4. 오직 주제와 전혀 상관없는 무의미한 소음이나 완전히 무관한 잡담일 때만 'N'을 출력하세요.\n\n"
+            f"결과(Y/N):"
         )
 
         response = self._ollama_request(prompt, timeout=20)
-        if response:
-            ans = str(response).upper()
-            if "N" in ans and "Y" not in ans:
-                return False
+        
+        if not response:
             return True
 
+        ans = str(response).upper()
+        
+        if "N" in ans and "Y" not in ans:
+            return False
         return True
+    
     def _read_wave(self, path):
         import wave
         import audioop
@@ -550,48 +563,48 @@ class CutEngine:
         return output_path
 
     def get_keep_intervals(self, vocal_wav_path, preset_data):
-        """Whisper 추출 -> Gemma 주제 분석 -> 문맥 필터링"""
-        if self.stt_model is None:
-            sys.stdout.write("\r[LOG] Whisper AI 모델 로딩 중...")
-            sys.stdout.flush()
-            self.stt_model = WhisperModel("base", device="cpu", compute_type="int8")
-            print("\n[LOG] 모델 로딩 완료.")
+        self.activate()
 
-        print(f"[2/3] 음성 인식 및 문맥 분석 시작...")
+        print(f"[2/3] 구간 분석 시작...")
+        import time
+        time.sleep(3)
+        
         segments, _ = self.stt_model.transcribe(vocal_wav_path)
         all_segments = list(segments)
 
-        subtitles_dir = os.path.join(self.output_dir, "subtitles")
-        os.makedirs(subtitles_dir, exist_ok=True)
-        file_no_ext = os.path.basename(os.path.dirname(vocal_wav_path))
-        full_subtitles_file = os.path.join(subtitles_dir, f"{file_no_ext}_full_subtitles.txt")
-        with open(full_subtitles_file, 'w', encoding='utf-8') as f:
-            for i, s in enumerate(all_segments, 1):
-                f.write(f"{i}\n{s.start:.2f} --> {s.end:.2f}\n{s.text}\n\n")
-        
         if not all_segments:
-            print("[경고] 인식된 음성이 없습니다.")
+            print("[경고] 인식된 음성이 없습니다. 사운드 기반 분석을 고려하세요.")
             return []
 
         full_text = " ".join([s.text for s in all_segments])
         auto_topic = self._extract_topic(full_text)
+        is_ollama_active = (auto_topic != "General")
         
+        if not is_ollama_active:
+            print("[알림] Ollama 연결 실패. 일반 사운드/VAD 기반 컷편집으로 진행합니다.")
+
         padding_i = preset_data.get("padding_i", 0.4)
         padding_o = preset_data.get("padding_o", 0.6)
         
         intervals = []
         for i, s in enumerate(all_segments):
             pct = (i + 1) / len(all_segments) * 100
+            is_silent = self._is_silent_segment(vocal_wav_path, s.start, s.end)
             
-            if self._is_silent_segment(vocal_wav_path, s.start, s.end):
+            if is_silent:
                 status = "무음 제거"
-            elif self._check_segment_relevance(s.text, auto_topic):
-                intervals.append((max(0, s.start - padding_i), s.end + padding_o, s.text))
-                status = "유지"
             else:
-                status = "제거"
+                if is_ollama_active:
+                    if self._check_segment_relevance(s.text, auto_topic):
+                        intervals.append((max(0, s.start - padding_i), s.end + padding_o, s.text))
+                        status = "유지(문맥)"
+                    else:
+                        status = "제거(문맥)"
+                else:
+                    intervals.append((max(0, s.start - padding_i), s.end + padding_o, s.text))
+                    status = "유지(사운드)"
             
-            sys.stdout.write(f"\r[{pct:3.0f}%] {status}: {s.text[:35]}...    ")
+            sys.stdout.write(f"[{pct:3.0f}%] {status}: {s.text[:35]}...    \n")
             sys.stdout.flush()
         
         print("\n[LOG] 구간 분석 완료.")
@@ -682,29 +695,55 @@ class OllamaWorker(QObject):
         finally:
             self.finished_signal.emit(success)
 
+    def _wait_for_server(self, timeout=30):
+        start_time = time.time()
+        while time.time() - start_time < timeout:
+            try:
+                response = requests.get("http://localhost:11434/api/tags", timeout=2)
+                if response.status_code == 200:
+                    return True
+            except:
+                pass
+            time.sleep(2)
+        return False
+
     def _bootstrap_ollama(self):
         model_name = "anpigon/eeve-korean-10.8b"
-        candidates = [
-            os.path.join(PROJECT_ROOT, "AppData", "Local", "Programs", "Ollama", "ollama.exe"),
-            shutil.which("ollama"), 
-            os.path.join(os.environ.get("LOCALAPPDATA", ""), "Programs", "Ollama", "ollama.exe"),
-        ]
         
+        candidates = [
+            shutil.which("ollama"),
+            os.path.join(os.environ.get("LOCALAPPDATA", ""), "Programs", "Ollama", "ollama.exe"),
+            os.path.join(os.environ.get("USERPROFILE", ""), "AppData", "Local", "Programs", "Ollama", "ollama.exe"),
+            "C:\\Program Files\\Ollama\\ollama.exe"
+        ]
         ollama_bin = next((c for c in candidates if c and os.path.exists(c)), None)
 
         if not ollama_bin:
-            self.progress_signal.emit("Ollama 미설치 상태입니다. 자동 설치를 시작합니다...")
+            self.progress_signal.emit("Ollama를 찾을 수 없어 설치를 시도합니다...")
             installer_path = os.path.join(PROJECT_ROOT, "OllamaSetup.exe")
             url = "https://ollama.com/download/OllamaSetup.exe"
             try:
                 urllib.request.urlretrieve(url, installer_path)
-                self.progress_signal.emit("설치 프로그램 실행 중... 잠시만 기다려주세요.")
                 subprocess.run([installer_path, "/S"], check=True)
                 os.remove(installer_path)
-                time.sleep(10)
-                ollama_bin = next((c for c in candidates if c and os.path.exists(c)), None)
+                for _ in range(15):
+                    time.sleep(2)
+                    ollama_bin = next((c for c in candidates if c and os.path.exists(c)), None)
+                    if ollama_bin: break
             except Exception as e:
-                self.progress_signal.emit(f"자동 설치 중 오류: {e}")
+                self.progress_signal.emit(f"자동 설치 실패: {e}")
+                return False
+
+        if not self._wait_for_server(timeout=3):
+            self.progress_signal.emit("Ollama 서버를 시작합니다...")
+            subprocess.Popen(
+                [ollama_bin, "serve"],
+                creationflags=subprocess.CREATE_NO_WINDOW,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL
+            )
+            if not self._wait_for_server(timeout=30):
+                self.progress_signal.emit("서버 응답 시간 초과. 수동 실행이 필요할 수 있습니다.")
                 return False
 
         try:
@@ -712,39 +751,35 @@ class OllamaWorker(QObject):
             models = [m['name'] for m in response.json().get('models', [])]
             
             if not any(model_name in m for m in models):
-                self.progress_signal.emit(f"{model_name} 모델이 없어 다운로드를 시작합니다 (약 7.7GB).")
-              
+                self.progress_signal.emit(f"모델 다운로드 중 (약 7.7GB)...")
                 process = subprocess.Popen(
                     [ollama_bin, "pull", model_name], 
-                    stdout=subprocess.PIPE, 
-                    stderr=subprocess.STDOUT, 
-                    text=True,
-                    encoding="utf-8",     
-                    errors="replace",     
+                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT, 
+                    text=True, encoding="utf-8", errors="replace",
                     creationflags=subprocess.CREATE_NO_WINDOW
                 )
-                
                 if process.stdout:
                     for line in process.stdout:
                         if "downloading" in line.lower():
-                            self.progress_signal.emit(f"모델 다운로드 중: {line.strip()[-20:]}")
+                            clean_line = line.strip().split('\r')[-1]
+                            if "%" in clean_line:
+                                self.progress_signal.emit(f"다운로드 {clean_line[-20:]}")
                 process.wait()
-                
-            try:
-                requests.get("http://localhost:11434/api/tags", timeout=2)
-            except (requests.exceptions.ConnectionError, requests.exceptions.Timeout):
-                self.progress_signal.emit("Ollama 서버를 백그라운드에서 시작합니다...")
-                subprocess.Popen(
-                    [ollama_bin, "serve"],
-                    creationflags=subprocess.CREATE_NO_WINDOW,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL
-                )
-                time.sleep(5) 
-                    
-            self.progress_signal.emit("AI 분석 엔진 준비 완료.")
-            return True
-    
         except Exception as e:
-            self.progress_signal.emit(f"모델 확인 중 오류 발생: {e}")
+            self.progress_signal.emit(f"모델 확인 중 오류: {e}")
             return False
+
+        self.progress_signal.emit("LLM 모델을 메모리에 로드 중입니다 (비동기 시도)...")
+        try:
+            requests.post(
+                "http://localhost:11434/api/generate",
+                json={"model": model_name, "prompt": "hi", "stream": False, "keep_alive": -1},
+                timeout=1 
+            )
+        except requests.exceptions.ReadTimeout:
+            self.progress_signal.emit("모델 로딩 신호를 보냈습니다.")
+        except Exception as e:
+            print(f"로드 요청 전송 중 무시된 예외: {e}")
+
+        self.progress_signal.emit("AI 분석 엔진 초기화 완료.")
+        return True

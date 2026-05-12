@@ -32,6 +32,7 @@ class PresetManager:
             with open(path, "w", encoding="utf-8") as f:
                 json.dump(data, f, indent=4, ensure_ascii=False)
             print(f"프리셋 저장 완료: {path}")
+            print(f"========================================")
             return True
         except Exception as e:
             print(f"프리셋 저장 실패: {e}")

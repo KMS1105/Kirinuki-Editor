@@ -40,7 +40,7 @@ class AnalysisThread(QThread):
         from pipeline import StyleAnalyzer, CutEngine
         
         engine = CutEngine()
-        analyzer = StyleAnalyzer(ffmpeg_bin_path=engine.ffmpeg_bin_path)
+        self.analyzer = StyleAnalyzer(ffmpeg_bin_path=engine.ffmpeg_dir)
             
         style_result = self.analyzer.analyze_user_styles(
             self.origins, 
