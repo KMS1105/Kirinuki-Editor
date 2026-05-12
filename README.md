@@ -2,7 +2,8 @@
 
 ## 엔비디아 환경에서 torch 재설치 필요
 
-python -m pip install torch==2.1.0 torchaudio==2.1.0 torchvision --index-url https://download.pytorch.org/whl/cu121
+```bash
+python -m pip install torch==2.1.0 torchaudio==2.1.0 torchvision --index-url [https://download.pytorch.org/whl/cu121](https://download.pytorch.org/whl/cu121)
 
 ## PANNs (Audio Tagging) 모델: 소리 이벤트를 감지하는 데 사용됩니다.
 
