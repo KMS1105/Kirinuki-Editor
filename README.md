@@ -25,3 +25,9 @@ Whisper (STT) 모델: 음성 인식을 담당하며, 코드 실행 시 small 또
 FFmpeg (Essentials Build): 영상 인코딩 및 디코딩의 엔진입니다. (자동)
 
 다운로드 링크: https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip
+
+---
+
+## Today's To Do List
+
+상관 관계 프롬프트 개선
