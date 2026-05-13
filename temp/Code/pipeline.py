@@ -623,7 +623,13 @@ class CutEngine:
         intervals = [(s, e) for s, e, t in kept_segments]
         if not intervals: intervals = [(0, clip.duration)]
 
-        clips = [clip.subclip(s, min(clip.duration, e)) for s, e in intervals]
+        clips = []
+        for s, e in intervals:
+            end_t = min(clip.duration, e)
+            if hasattr(clip, "subclipped"):
+                clips.append(clip.subclipped(s, end_t)) 
+            else:
+                clips.append(clip.subclip(s, end_t))     
         if not clips: return
 
         final_video = concatenate_videoclips(clips)
