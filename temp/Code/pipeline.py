@@ -384,7 +384,7 @@ class CutEngine:
                 print("[LOG] Whisper 분리 전사 엔진 초기화...")
                 device = "cuda" if torch.cuda.is_available() else "cpu"
                 compute_type = "float16" if device == "cuda" else "int8"
-                self.stt_model = WhisperModel("turbo", device=device, compute_type=compute_type)
+                self.stt_model = WhisperModel("small", device=device, compute_type=compute_type)
             
             if self.sed_model is None:
                 print("[LOG] PANNs 오디오 감지 엔진 활성화...")
@@ -392,7 +392,7 @@ class CutEngine:
         except Exception as e:
             print(f"[오류] 엔진 가동 Fallback 스위칭: {e}")
             if self.stt_model is None:
-                self.stt_model = WhisperModel("turbo", device="cpu", compute_type="int8")
+                self.stt_model = WhisperModel("small", device="cpu", compute_type="int8")
 
     def _ollama_model_id(self):
         return "anpigon/eeve-korean-10.8b"
