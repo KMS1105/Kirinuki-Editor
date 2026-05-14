@@ -211,6 +211,7 @@ class StyleAnalyzer:
         ffmpeg_bin = self._get_ffmpeg_path()
         command = [
             ffmpeg_bin, '-i', video_path,
+            '-af', 'highpass=f=100,lowpass=f=3500,loudnorm=I=-16:TP=-1.5:LRA=11',
             '-ar', str(self.sample_rate), '-ac', '1', '-f', 's16le', '-'
         ]
         try:
@@ -383,7 +384,7 @@ class CutEngine:
                 print("[LOG] Whisper 분리 전사 엔진 초기화...")
                 device = "cuda" if torch.cuda.is_available() else "cpu"
                 compute_type = "float16" if device == "cuda" else "int8"
-                self.stt_model = WhisperModel("small", device=device, compute_type=compute_type)
+                self.stt_model = WhisperModel("turbo", device=device, compute_type=compute_type)
             
             if self.sed_model is None:
                 print("[LOG] PANNs 오디오 감지 엔진 활성화...")
@@ -391,7 +392,7 @@ class CutEngine:
         except Exception as e:
             print(f"[오류] 엔진 가동 Fallback 스위칭: {e}")
             if self.stt_model is None:
-                self.stt_model = WhisperModel("small", device="cpu", compute_type="int8")
+                self.stt_model = WhisperModel("turbo", device="cpu", compute_type="int8")
 
     def _ollama_model_id(self):
         return "anpigon/eeve-korean-10.8b"
@@ -414,7 +415,12 @@ class CutEngine:
                         "model": self._ollama_model_id(),
                         "prompt": prompt,
                         "stream": False,
-                        "options": {"temperature": 0.1, "top_p": 0.3, "num_predict": 2, "num_ctx": 1024}
+                        "options": {
+                            "temperature": 0.3,      
+                            "top_p": 0.5,            
+                            "num_predict": 192,      
+                            "num_ctx": 2048          
+                        }
                     },
                     timeout=timeout,
                 )
@@ -426,20 +432,40 @@ class CutEngine:
         return None
 
     def _extract_topic(self, full_text):
-        if not full_text: return "General"
+        if not full_text or not full_text.strip(): return "General"
+        
         prompt = (
-            f"영상의 스크립트를 분석하여 핵심 키워드 10~20개를 추출하세요.\n"
-            f"규칙:\n"
-            f"1. 설명이나 인사말 없이 오직 키워드만 쉼표(,)로 구분하여 나열하십시오.\n"
-            f"2. 주제, 등장인물, 주요 사건, 감정 상태를 모두 포함하세요.\n"
-            f"3. 비속어나 거친 표현이 있다면 순화하지 말고 그 분위기를 살린 키워드로 만드세요.\n"
-            f"4. 반드시 10개 이상의 키워드를 생성하세요.\n\n"
-            f"스크립트: {full_text[:1500]}\n\n"
-            f"결과(키워드만):"
-
+            f"### 시스템 역할: 당신은 음성 인식(STT) 오타가 심한 동영상 스크립트를 분석하여 문맥을 파악하고 올바른 핵심 키워드를 도출하는 지능형 언어 모델입니다.\n\n"
+            f"[상황 분석 및 미션]\n"
+            f"현재 제공된 스크립트는 마이크 잡음이나 발음 웅얼거림으로 인해, 원본 단어의 발음이 깨져서 유령 단어(예: '보아나', '살소', '직체기' 등)로 잘못 녹취되어 있습니다.\n"
+            f"당신은 이러한 엉터리 단어들을 단순 삭제하지 말고, 문장 전체의 흐름과 앞뒤 맥락을 살펴 **'말하는 사람이 실제로 하려던 원래 단어나 주제가 무엇이었을지' 최고 확률로 유추 및 복원(문맥 필터링)**해야 합니다.\n\n"
+            f"[엄격한 키워드 변환 규칙]\n"
+            f"1. **절대로** 스크립트에 적힌 꼬인 발음 형태('살소', '직체기' 등)를 그대로 출력하지 마십시오.\n"
+            f"2. 문맥을 분석하여 해당 엉터리 단어의 원본 의미를 유추한 뒤, 반드시 **정상적이고 완벽한 한국어 표준어 단어**로 교정해서 키워드 목록에 포함하세요.\n"
+            f"3. 만약 도저히 문맥적으로도 유추가 불가능한 완전한 소음 파편이라면 그때는 과감히 제외하십시오.\n"
+            f"4. 오직 핵심 키워드 단어들만 쉼표(,)로 구분하여 나열하고, 인사말이나 사족('주제:', '결과:')은 절대 넣지 마세요.\n"
+            f"5. 영상의 핵심 상황, 감정 상태, 주요 행동을 대변하는 유효한 단어를 최소 10개 이상, 20개 이하로 추출하세요.\n\n"
+            f"[현재 영상 스크립트 (오타 포함)]\n"
+            f"{full_text[:1500]}\n\n"
+            f"결과(교정 및 유추를 완료한 10개 이상의 정상 단어 목록):"
         )
+        print("[LOG] LLM 분석 엔진을 통해 영상 핵심 키워드 추출을 시작합니다...")
         response = self._ollama_request(prompt, timeout=300)
-        return str(response).strip() if response else "General"
+
+        if response:
+            clean_res = str(response).strip()
+            for prefix in ["결과:", "주제 키워드:", "주제:", "키워드:"]:
+                if clean_res.startswith(prefix):
+                    clean_res = clean_res[len(prefix):].strip()
+        
+            print("=" * 60)
+            print(f"[주제 키워드 추출 완료]\n-> {clean_res}")
+            print("=" * 60)
+            return clean_res
+        
+        print("[주제 키워드] 모델 응답이 없어 'General' 모드로 대체합니다.")
+        
+        return "General"
 
     def _check_segment_relevance_with_sound(self, text, topic, sound_event, previous_events):
         if topic == "General" or not text.strip(): return True
@@ -518,7 +544,15 @@ class CutEngine:
         except Exception as e:
             print(f"[경고] SED 전처리 버퍼 변환 실패: {e}")
 
-        segments, _ = self.stt_model.transcribe(vocal_wav_path)
+        segments, _ = self.stt_model.transcribe(
+            vocal_wav_path,
+            language="ko",
+            beam_size=5,
+            patience=1.0,
+            temperature=[0.0, 0.2, 0.4],
+            no_repeat_ngram_size=3, 
+            initial_prompt="안녕하세요. 다음은 자연스러운 한국어 대화 녹음입니다. 비속어, 한숨, 신조어, 웃음소리가 포함되어 있으며 문맥에 맞게 정확한 단어로 받아 적습니다. 음.. 어.. 같은 의미 없는 단어는 가급적 제외합니다."
+        )
         all_segments = list(segments)
         if not all_segments: return []
 
@@ -622,6 +656,40 @@ class CutEngine:
         kept_segments = self.get_keep_intervals(vocal_wav, preset_data)
         intervals = [(s, e) for s, e, t in kept_segments]
         if not intervals: intervals = [(0, clip.duration)]
+
+        subtitles_dir = os.path.join(self.output_dir, "subtitles")
+        os.makedirs(subtitles_dir, exist_ok=True)
+        base_name = os.path.splitext(os.path.basename(input_path))[0]
+        
+        full_subtitle_file = os.path.join(subtitles_dir, f"{base_name}_full_subtitle.txt")
+        subtitle_file = os.path.join(subtitles_dir, f"{base_name}_subtitle.txt")
+
+        import re
+        def clean_repeated_text(text):
+            cleaned = re.sub(r'(\b\w+[!?.~]*\s*)\1{2,}', r'\1\1', text.strip())
+            return cleaned if cleaned else text.strip()
+
+        try:
+            with open(full_subtitle_file, 'w', encoding='utf-8') as f_full:
+                for i, (start, end, text) in enumerate(kept_segments, 1):
+                    refined_text = clean_repeated_text(text)
+                    if not refined_text:
+                        refined_text = text.strip()
+                    f_full.write(f"{i}\n{start:.2f} --> {end:.2f}\n{refined_text}\n\n")
+            print(f"[자막 생성] 타임코드 포함 전체 자막 저장 완료: {full_subtitle_file}")
+        except Exception as e:
+            print(f"[경고] full_subtitle 생성 중 오류 발생: {e}")
+
+        try:
+            with open(subtitle_file, 'w', encoding='utf-8') as f_sub:
+                for _, _, text in kept_segments:
+                    refined_text = clean_repeated_text(text)
+                    if not refined_text:
+                        refined_text = text.strip()
+                    f_sub.write(f"{refined_text}\n")
+            print(f"[자막 생성] 텍스트 전용 자막 저장 완료: {subtitle_file}")
+        except Exception as e:
+            print(f"[경고] subtitle 생성 중 오류 발생: {e}")
 
         clips = []
         for s, e in intervals:
@@ -776,7 +844,7 @@ class OllamaWorker(QObject):
         if not ensure_model_pulled(model_name):
             return False
 
-        self.progress_signal.emit("LLM 모델을 외장 GPU VRAM에 로드하는 중입니다...")
+        self.progress_signal.emit("LLM 모델을 VRAM에 로드하는 중입니다...")
         use_fallback = False
 
         try:
@@ -803,7 +871,7 @@ class OllamaWorker(QObject):
                 return False
                 
             self._ollama_model_id = lambda: fallback_model
-            self.progress_signal.emit("경량 모델을 외장 GPU VRAM에 다시 로드 중입니다...")
+            self.progress_signal.emit("경량 모델을 VRAM에 다시 로드 중입니다...")
             
             try:
                 requests.post(
