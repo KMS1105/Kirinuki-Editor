@@ -551,7 +551,7 @@ class CutEngine:
             patience=1.0,
             temperature=[0.0, 0.2, 0.4],
             no_repeat_ngram_size=3, 
-            initial_prompt="안녕하세요. 다음은 자연스러운 한국어 대화 녹음입니다. 비속어, 한숨, 신조어, 웃음소리가 포함되어 있으며 문맥에 맞게 정확한 단어로 받아 적습니다. 음.. 어.. 같은 의미 없는 단어는 가급적 제외합니다."
+            initial_prompt="안녕하세요. 다음은 자연스러운 한국어 대화 녹음입니다. 비속어, 한숨, 신조어, 웃음소리가 포함되어 있으며 문맥에 맞게 정확한 단어로 받아 적습니다."
         )
         all_segments = list(segments)
         if not all_segments: return []
