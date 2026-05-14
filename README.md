@@ -1,7 +1,9 @@
 # Kirinuki-Editor
 
+```bash
 $env:PYTHONUTF8 = 1
 pip install -r requirements.txt
+```
 
 ## 엔비디아 환경에서 torch 재설치 필요
 
