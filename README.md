@@ -10,7 +10,7 @@ python -m pip install torch==2.1.0 torchaudio==2.1.0 torchvision --index-url [ht
 
 가중치(Cnn14): https://zenodo.org/record/3987831/files/Cnn14_mAP%3D0.431.pth?download=1
 
-클래스 라벨(CSV): http://storage.googleapis.com/us_audioset/youtube_corpus/v1/csv/class_labels_indices.csv
+클래스 라벨(CSV): http://storage.googleapis.com/us_audioset/youtube_corpus/v1/csv/class_labels_indices.csv?download=1
 
 ---
 
