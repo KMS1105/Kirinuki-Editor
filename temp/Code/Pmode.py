@@ -30,24 +30,24 @@ class LogStream(QObject):
 class AnalysisThread(QThread):
     finished_signal = Signal(dict)
 
-    def __init__(self, origins, editeds, preset_name):
+    def __init__(self, origins, editeds, preset_name, domains):
         super().__init__()
         self.origins = origins
         self.editeds = editeds
         self.preset_name = preset_name
+        self.domains = domains
 
     def run(self):
-        from pipeline import StyleAnalyzer, CutEngine
-        
-        engine = CutEngine()
-        self.analyzer = StyleAnalyzer(ffmpeg_bin_path=engine.ffmpeg_dir)
+        try:
+            from pipeline import StyleAnalyzer
+            analyzer = StyleAnalyzer(domains=self.domains) 
+            results = analyzer.analyze_user_styles(self.origins, self.editeds, self.preset_name)
+            self.finished_signal.emit({"status": "success", "data": results})
             
-        style_result = self.analyzer.analyze_user_styles(
-            self.origins, 
-            self.editeds, 
-            self.preset_name, 
-        )
-        self.finished_signal.emit(style_result)
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            self.finished_signal.emit({"status": "error", "message": str(e)})
 
 class EditThread(QThread):
     finished_signal = Signal()
@@ -207,7 +207,25 @@ class PmodeWidget(QWidget):
         main_layout.addWidget(self.btn_main_run)
 
     def init_analysis_tab(self):
-        tab = QWidget(); layout = QVBoxLayout(tab)
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+
+        domain_group = QGroupBox("분석 도메인 설정 (카테고리)")
+        domain_layout = QHBoxLayout(domain_group)
+
+        self.domain_checks = []
+        categories = [
+            ("게임", "Gaming"), ("토크", "Talking"), ("노래", "Singing"), 
+            ("쇼츠", "Shorts"), ("롱폼", "Longform")
+        ]
+        
+        for kor, eng in categories:
+            chk = QCheckBox(kor)
+            chk.setProperty("eng_name", eng)
+            self.domain_checks.append(chk)
+            domain_layout.addWidget(chk)         
+        layout.addWidget(domain_group)
+
         layout.addWidget(QLabel("<b>[1] 원본 영상 리스트</b>"))
         self.list_analysis_origin = DropListWidget(self); layout.addWidget(self.list_analysis_origin)
         layout.addWidget(QLabel("<b>[2] 결과 영상 리스트 (편집본)</b>"))
@@ -218,7 +236,17 @@ class PmodeWidget(QWidget):
         self.btn_do_analysis.setStyleSheet("QPushButton { background-color: #2980b9; color: white; border-radius: 4px; }")
         self.btn_do_analysis.clicked.connect(self.on_click_analysis)
         layout.addWidget(self.btn_do_analysis)
+        
         self.tab_widget.addTab(tab, "스타일 분석")
+        
+    def sync_domain_selection(self):
+        sender = self.sender()
+        if sender.isChecked():
+            for chk in self.domain_checks:
+                if chk != sender:
+                    chk.setChecked(False)
+        else:
+            sender.setChecked(True)
         
     def init_log_tab(self):
         tab = QWidget()
@@ -274,8 +302,19 @@ class PmodeWidget(QWidget):
     def on_click_analysis(self):
         origins = self.list_analysis_origin.data_store
         editeds = self.list_analysis_edited.data_store
-        if not origins or not editeds:
-            QMessageBox.warning(self, "알림", "분석할 파일을 추가해주세요.")
+        
+        selected_domains = []
+        
+        for chk in self.domain_checks:
+            if chk.isChecked():
+                domain_name = chk.property("eng_name")
+                selected_domains.append(domain_name)
+            
+        if not selected_domains:
+            selected_domains = ["Talking"]
+
+        if not selected_domains:
+            QMessageBox.warning(self, "알림", "분석 카테고리를 하나 이상 선택해주세요.")
             return
 
         preset_name, ok = QInputDialog.getText(self, "스타일 저장", "프리셋 이름을 입력하세요:")
@@ -285,12 +324,11 @@ class PmodeWidget(QWidget):
         self.target_preset_name = preset_name
         self.btn_do_analysis.setEnabled(False)
 
-        self.analysis_worker = AnalysisThread(origins, editeds, preset_name)
+        self.analysis_worker = AnalysisThread(origins, editeds, preset_name, selected_domains)
         self.analysis_worker.finished_signal.connect(self.on_analysis_finished)
         self.analysis_worker.start()
         
     def update_log_display(self, text, overwrite):
-        """오류를 수정한 로그 갱신 함수"""
         cursor = self.log_display.textCursor()
         
         if overwrite:

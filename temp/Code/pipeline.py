@@ -9,6 +9,7 @@ warnings.filterwarnings("ignore", message=".*unauthenticated requests.*")
 warnings.filterwarnings("ignore", message=".*HF_TOKEN.*")
 warnings.filterwarnings("ignore", category=UserWarning, module="huggingface_hub")
 warnings.filterwarnings("ignore", message=".*bytes wanted but 0 bytes read.*")
+warnings.filterwarnings("ignore", category=UserWarning, module="webrtcvad")
 
 import sys
 import subprocess
@@ -27,18 +28,34 @@ os.environ['HF_HUB_DISABLE_SYMLINKS_WARNING'] = '1'
 
 from faster_whisper import WhisperModel
 import torchaudio
+import imageio_ffmpeg
 
 try:
-    import imageio_ffmpeg
     ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
     ffmpeg_dir = os.path.dirname(ffmpeg_exe)
+    
     if ffmpeg_dir not in os.environ["PATH"]:
         os.environ["PATH"] = ffmpeg_dir + os.pathsep + os.environ["PATH"]
-    import torchaudio
-    if "ffmpeg" in torchaudio.list_audio_backends():
-        torchaudio.set_audio_backend("ffmpeg")
+
+    try:
+        if hasattr(torchaudio, 'list_audio_backends'):
+            if "ffmpeg" in torchaudio.list_audio_backends():
+                torchaudio.set_audio_backend("ffmpeg")
+        else:
+            pass 
+    except:
+        pass
+
 except Exception as e:
-    print(f"[경고] FFmpeg 경로 설정 중 오류: {e}")
+    print(f"[경고] 시스템 환경 설정 중 확인 필요: {e}")
+
+if torch.cuda.is_available():
+    device = 'cuda'
+    backend_name = "NVIDIA_CUDA_Acceleration"
+else:
+    device = 'cpu'
+    is_intel = "INTEL" in os.environ.get("PROCESSOR_IDENTIFIER", "").upper()
+    backend_name = "GPU" if is_intel else "Generic_CPU"
 
 import struct
 import webrtcvad
@@ -188,164 +205,855 @@ class GUIProgressLogger(ProgressBarLogger):
             if pct > self.last_pct:
                 print(f"\r[렌더링 진행] {pct}% 완료...")
                 self.last_pct = pct
-                
+
+import os
+import time
+import json
+import numpy as np
+import torch
+import torch.nn as nn
+import torchvision.models as models
+import torchvision.transforms as transforms
+from torchvision.models import ResNet18_Weights
+from scipy.spatial.distance import cosine
+import cv2
+import platform
+import psutil
+from PIL import Image, ImageDraw, ImageFont, ImageOps, ImageEnhance
+from faster_whisper import WhisperModel
+from panns_inference import AudioTagging
+from sklearn.cluster import DBSCAN
+import webrtcvad
+from panns_inference import AudioTagging
+from preset import PresetManager
+from fontTools import ttLib
+
 class StyleAnalyzer:
-    def __init__(self, ffmpeg_bin_path=None):
+    def __init__(self, ffmpeg_bin_path=None, domains=["Talking"]):
         self.vad = webrtcvad.Vad(3)
         self.sample_rate = 16000
         self.pm = PresetManager()
         self.ffmpeg_bin_path = ffmpeg_bin_path
+        self.device = "cuda" if torch.cuda.is_available() else "cpu"
         self.stt_model = None
+        self.font_db = {}
+        self.font_embeddings = {}
+        
+        weights = ResNet18_Weights.DEFAULT
+        base_model = models.resnet18(weights=weights).to(self.device)
+        self.feature_extractor = nn.Sequential(*list(base_model.children())[:-1])
+        self.feature_extractor.eval()
+        
+        self.transform = transforms.Compose([
+            transforms.Resize((128, 128)),
+            transforms.Grayscale(num_output_channels=3),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+        ])
+
+        self._load_font_database()
+        self._precompute_font_embeddings()
+
         try:
-            self.sed_model = AudioTagging(checkpoint_path=None, device='cuda' if torch.cuda.is_available() else 'cpu')
+            self.sed_model = AudioTagging(
+                checkpoint_path=None,
+                device=self.device
+            )
         except:
             self.sed_model = None
-        self.interest_events = ['Sigh', 'Laughter', 'Gasp', 'Cough', 'Snicker', 'Whispering']
-        
+
+        self.interest_events = [
+            "Sigh",
+            "Laughter",
+            "Gasp",
+            "Cough",
+            "Snicker",
+            "Whispering"
+        ]
+
+        self.domains = [domains] if isinstance(domains, str) else domains
+        self.domain_map = {
+            "게임": "Gaming",
+            "토크": "Talking",
+            "노래": "Singing",
+            "쇼츠": "Shorts",
+            "롱폼": "Longform"
+        }
+
+        current_dir = os.path.dirname(os.path.abspath(__file__))
+        self.project_root = os.path.dirname(current_dir)
+        self.font_db = {}
+        self.project_root = os.path.dirname(
+            os.path.dirname(
+                os.path.abspath(__file__)
+            )
+        )
+
+        self._load_font_database()
+        print(f"[LOG] 폰트 로드 완료: {len(self.font_db)}개")
+
     def _get_ffmpeg_path(self):
+        possible_paths = []
+
         if self.ffmpeg_bin_path:
-            return os.path.join(self.ffmpeg_bin_path, "ffmpeg.exe")
-        return "ffmpeg"
+            possible_paths.append(self.ffmpeg_bin_path)
+            possible_paths.append(
+                os.path.join(
+                    self.ffmpeg_bin_path,
+                    "ffmpeg.exe"
+                )
+            )
+
+        local_ffmpeg = os.path.join(
+            self.project_root,
+            "ffmpeg",
+            "bin",
+            "ffmpeg.exe"
+        )
+
+        possible_paths.append(local_ffmpeg)
+
+        for path in possible_paths:
+            if os.path.isfile(path):
+                print(f"[LOG] FFmpeg 사용: {path}")
+                return path
+
+        ffmpeg_sys = shutil.which("ffmpeg")
+
+        if ffmpeg_sys:
+            print(f"[LOG] 시스템 FFmpeg 사용: {ffmpeg_sys}")
+            return ffmpeg_sys
+
+        raise FileNotFoundError(
+            "FFmpeg를 찾을 수 없습니다"
+        )
 
     def _get_audio_data(self, video_path):
         ffmpeg_bin = self._get_ffmpeg_path()
         command = [
-            ffmpeg_bin, '-i', video_path,
-            '-af', 'highpass=f=100,lowpass=f=3500,loudnorm=I=-16:TP=-1.5:LRA=11',
-            '-ar', str(self.sample_rate), '-ac', '1', '-f', 's16le', '-'
+            ffmpeg_bin,
+            "-i", video_path,
+            "-ar", str(self.sample_rate),
+            "-ac", "1",
+            "-f", "s16le",
+            "-"
         ]
+
         try:
-            process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+            process = subprocess.Popen(
+                command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL
+            )
             raw_audio, _ = process.communicate()
-            if not raw_audio: return None
-            return np.frombuffer(raw_audio, dtype=np.int16).astype(np.float32) / 32768.0
+
+            if not raw_audio:
+                return None
+
+            return (
+                np.frombuffer(
+                    raw_audio,
+                    dtype=np.int16
+                ).astype(np.float32) / 32768.0
+            )
+
+        except Exception as e:
+            print(f"[LOG] 오디오 추출 실패: {video_path}")
+            print(e)
+            return None
+
+    def _extract_subtitle_roi(self, frame):
+        hsv = cv2.cvtColor(
+            frame,
+            cv2.COLOR_BGR2HSV
+        )
+        mask = cv2.inRange(
+            hsv,
+            np.array([0, 0, 160]),
+            np.array([180, 90, 255])
+        )
+        kernel = np.ones((3, 3), np.uint8)
+        mask = cv2.morphologyEx(
+            mask,
+            cv2.MORPH_CLOSE,
+            kernel
+        )
+        contours, _ = cv2.findContours(
+            mask,
+            cv2.RETR_EXTERNAL,
+            cv2.CHAIN_APPROX_SIMPLE
+        )
+
+        if len(contours) == 0:
+            return None, None
+
+        contours = sorted(
+            contours,
+            key=cv2.contourArea,
+            reverse=True
+        )
+        boxes = []
+
+        for c in contours[:80]:
+            x, y, w, h = cv2.boundingRect(c)
+            
+            if w < 6 or h < 6:
+                continue
+
+            boxes.append((x, y, w, h))
+
+        if len(boxes) == 0:
+            return None, None
+
+        x1 = min([b[0] for b in boxes])
+        y1 = min([b[1] for b in boxes])
+
+        x2 = max([b[0] + b[2] for b in boxes])
+        y2 = max([b[1] + b[3] for b in boxes])
+
+        roi = frame[y1:y2, x1:x2]
+        roi_mask = mask[y1:y2, x1:x2]
+
+        return roi, roi_mask
+    
+    def _load_font_database(self):
+        from fontTools import ttLib
+        import os
+
+        user_font_dir = os.path.join(os.environ.get('LOCALAPPDATA', ''), 'Microsoft', 'Windows', 'Fonts')
+        target_dirs = ["C:/Windows/Fonts"]
+        if os.path.exists(user_font_dir):
+            target_dirs.append(user_font_dir)
+
+        print(f"[LOG] 자동 분석을 위한 전체 폰트 스캔 시작...")
+        
+        for font_dir in target_dirs:
+            if not os.path.isdir(font_dir): continue
+            for file in os.listdir(font_dir):
+                if not file.lower().endswith((".ttf", ".otf", ".ttc")): continue
+                
+                font_path = os.path.join(font_dir, file)
+                try:
+                    font_idx = 0 if file.lower().endswith(".ttc") else -1
+                    tt = ttLib.TTFont(font_path, fontNumber=font_idx, lazy=True)
+                    
+                    font_name = tt['name'].getDebugName(4) or tt['name'].getDebugName(1) or os.path.splitext(file)[0]
+                    font_name = font_name.replace('\x00', '').strip()
+                    
+                    if font_name not in self.font_db:
+                        self.font_db[font_name] = font_path
+                except:
+                    continue
+        print(f"[LOG] 총 {len(self.font_db)}개의 폰트 로드 완료. 자동 분석 준비됨.")
+
+        self.font_candidates = {
+            "thin": [],
+            "normal": [],
+            "bold": []
+        }
+
+        for font_name, font_path in self.font_db.items():
+            lower = font_name.lower()
+
+            if any(x in lower for x in [
+
+                "thin",
+                "light",
+                "extralight"
+
+            ]):
+                self.font_candidates[
+                    "thin"
+                ].append((
+                    font_name,
+                    font_path
+                ))
+
+            elif any(x in lower for x in [
+                "bold",
+                "black",
+                "heavy",
+                "extrabold"
+
+            ]):
+                self.font_candidates[
+                    "bold"
+                ].append((
+                    font_name,
+                    font_path
+                ))
+
+            else:
+                self.font_candidates[
+                    "normal"
+                ].append((
+                    font_name,
+                    font_path
+                ))
+
+        print(
+            f"[LOG] 로드된 폰트 수: "
+            f"{len(self.font_db)}"
+        )
+
+    def _render_font_text(self, text, font_path, size=100):
+        canvas_w, canvas_h = 1024, 256
+        canvas = Image.new("L", (canvas_w, canvas_h), 0)
+        draw = ImageDraw.Draw(canvas)
+
+        try:
+            font = ImageFont.truetype(font_path, size)
+            
+            bbox = draw.textbbox((0, 0), text, font=font)
+            w, h = bbox[2] - bbox[0], bbox[3] - bbox[1]
+            draw.text(((canvas_w - w) // 2, (canvas_h - h) // 2), text, fill=255, font=font)
+            
+            return np.array(canvas)
         except:
             return None
 
-    def analyze_user_styles(self, original_paths, edited_paths, preset_name):
-        label_map = {0: 'Speech', 15: 'Laughter', 16: 'Sigh', 17: 'Snicker', 18: 'Gasp', 22: 'Cough', 25: 'Whispering'}
-        collected_metrics = {
-            event: {"thresholds": [], "paddings_i": [], "paddings_o": []} 
-            for event in self.interest_events
+    def _compare_font_similarity(self, roi_mask, rendered):
+        try:
+            h, w = rendered.shape[:2]
+            resized = cv2.resize(
+                roi_mask,
+                (w, h)
+            )
+
+            resized = cv2.threshold(
+                resized,
+                127,
+                255,
+                cv2.THRESH_BINARY
+            )[1]
+
+            rendered = cv2.threshold(
+                rendered,
+                127,
+                255,
+                cv2.THRESH_BINARY
+            )[1]
+
+            diff = cv2.absdiff(
+                resized,
+                rendered
+            )
+
+            edge_a = cv2.Canny(
+                resized,
+                100,
+                200
+            )
+
+            edge_b = cv2.Canny(
+                rendered,
+                100,
+                200
+            )
+
+            edge_diff = cv2.absdiff(
+                edge_a,
+                edge_b
+            )
+
+            pixel_score = (
+                1.0 -
+                (np.mean(diff) / 255.0)
+            )
+
+            edge_score = (
+                1.0 -
+                (np.mean(edge_diff) / 255.0)
+            )
+
+            final_score = (
+                pixel_score * 0.65 +
+                edge_score * 0.35
+            )
+
+            return float(final_score)
+
+        except:
+            return 0.0
+
+    def _event_font_prior(self, font_name, event_name):
+        name = font_name.lower()
+        score = 1.0
+
+        if event_name == "Whispering":
+
+            if (
+                "thin" in name or
+                "light" in name
+            ):
+
+                score += 0.45
+
+            if (
+                "black" in name or
+                "heavy" in name
+            ):
+
+                score -= 0.6
+
+        elif event_name == "Gasp":
+            if (
+                "bold" in name or
+                "black" in name or
+                "heavy" in name
+            ):
+
+                score += 0.5
+
+            if (
+                "thin" in name or
+                "light" in name
+            ):
+
+                score -= 0.5
+
+        elif event_name == "Laughter":
+            if (
+                "rounded" in name or
+                "soft" in name
+            ):
+
+                score += 0.35
+
+        return score
+
+    def _detect_main_event(self, energy):
+        if energy < 0.015:
+            return "Whispering"
+
+        if energy > 0.08:
+            return "Gasp"
+
+        if energy > 0.05:
+            return "Laughter"
+
+        if energy > 0.03:
+            return "Snicker"
+
+        return "Talking"
+    
+    def _get_font_priority(self, font_path, text):
+        import re
+        from fontTools.ttLib import TTFont
+        has_korean = bool(re.search("[가-힣]", text))
+        if not has_korean: return 1.0
+        try:
+            font_idx = 0 if font_path.lower().endswith(".ttc") else -1
+            with TTFont(font_path, fontNumber=font_idx, lazy=True) as tt:
+                for table in tt['cmap'].tables:
+                    if 0xAC00 in table.cmap:
+                        return 1.2 
+            return 0.2 
+        except:
+            return 1.0
+        
+    def _get_image_vector(self, pil_img):
+        with torch.no_grad():
+            img_t = self.transform(pil_img.convert("RGB")).unsqueeze(0).to(self.device)
+            vector = self.feature_extractor(img_t)
+            return vector.flatten().cpu().numpy()
+
+    def _precompute_font_embeddings(self):
+        from PIL import Image, ImageOps, ImageEnhance
+        test_text = "각숑합QY7" 
+        print(f"[LOG] {len(self.font_db)}개 폰트 고정밀 인덱싱 시작...")
+        
+        for name, path in self.font_db.items():
+            try:
+                render_img = self._render_font_text(test_text, path)
+                if render_img is None: continue
+                
+                pil_img = Image.fromarray(render_img).convert("L")
+                bbox = pil_img.getbbox()
+                if bbox: pil_img = pil_img.crop(bbox)
+                pil_img = ImageOps.autocontrast(pil_img)
+                pil_img = ImageEnhance.Contrast(pil_img).enhance(2.5).convert("RGB")
+                
+                with torch.no_grad():
+                    img_t = self.transform(pil_img).unsqueeze(0).to(self.device)
+                    self.font_embeddings[name] = {
+                        "vector": self.feature_extractor(img_t).flatten().cpu().numpy(),
+                        "aspect_ratio": render_img.shape[1] / render_img.shape[0] 
+                    }
+            except: continue
+
+    def _match_font(self, sample_img, features, text, event_name):
+        best_font = "NanumGothic"
+        min_dist = float('inf')
+        
+        try:
+            sample_coords = np.column_stack(np.where(sample_img > 0))
+            if sample_coords.size == 0: return best_font, 0
+            
+            y1, x1 = sample_coords.min(axis=0); y2, x2 = sample_coords.max(axis=0)
+            cropped_sample = sample_img[y1:y2+1, x1:x2+1]
+            
+            kernel = np.ones((2, 2), np.uint8)
+            processed_sample = cv2.dilate(cropped_sample, kernel, iterations=1)
+            
+            density = np.count_nonzero(processed_sample) / (processed_sample.size + 1e-6)
+            
+            circularity = 0
+            contours, _ = cv2.findContours(processed_sample, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            if contours:
+                cnt = max(contours, key=cv2.contourArea)
+                area = cv2.contourArea(cnt)
+                (x, y), radius = cv2.minEnclosingCircle(cnt)
+                circle_area = np.pi * (radius ** 2)
+                if circle_area > 0:
+                    circularity = area / circle_area
+
+            sample_pil = Image.fromarray(processed_sample).convert("L")
+            sample_pil = ImageOps.autocontrast(sample_pil)
+            sample_pil = ImageEnhance.Contrast(sample_pil).enhance(2.5).convert("RGB")
+            
+            with torch.no_grad():
+                img_t = self.transform(sample_pil).unsqueeze(0).to(self.device)
+                sample_vec = self.feature_extractor(img_t).flatten().cpu().numpy()
+
+            has_hangul = any('가' <= char <= '힣' for char in text)
+
+            for name, font_data in self.font_embeddings.items():
+                vec = font_data["vector"] if isinstance(font_data, dict) else font_data
+                dist = cosine(sample_vec, vec)
+                
+                lname = name.lower()
+                
+                is_round_font = any(kw in lname for kw in ['round', 'cookie', 'jua', 'soft', '둥근', '어비'])
+                is_myeongjo = any(kw in lname for kw in ['myeongjo', 'batang', 'shinmyungjo', '명조', '바탕', '궁서'])
+                is_heavy_font = any(kw in lname for kw in ['black', 'bold', 'heavy', 'extra'])
+
+                if circularity > 0.45:
+                    if is_round_font: dist *= 0.65 
+                    if is_myeongjo: dist *= 2.5     
+                elif circularity < 0.25:
+                    if is_round_font: dist *= 1.5  
+                    if is_myeongjo: dist *= 0.9  
+
+                if density > 0.5: 
+                    if is_heavy_font or "cookierun" in lname: dist *= 0.8
+                    else: dist *= 1.5
+                elif density < 0.25: 
+                    if not is_heavy_font: dist *= 0.8
+                    else: dist *= 1.5
+
+                if has_hangul:
+                    k_keywords = ['nanum', 'gmarket', 'cookierun', 'rix', 'mapo', 'pretendard', 'hy', 'arita', 'bm', 'uhbee', 'hcr', '조선']
+                    if not any(k in lname for k in k_keywords):
+                        dist *= 2.0 
+
+                if dist < min_dist:
+                    min_dist = dist
+                    best_font = name
+            
+            final_conf = max(0.1, 1.0 - (min_dist * 1.2))
+            
+            print(f"   [결과] {best_font}")
+            print(f"         (밀도: {density:.2f} | 원형률: {circularity:.2f} | 신뢰도: {final_conf:.4f})")
+            
+            return best_font, final_conf
+            
+        except Exception as e:
+            print(f"[LOG] {e}")
+            return best_font, 0
+    
+    def _extract_jaso_features(self, roi_mask):
+        try:
+            if roi_mask is None:
+                return None
+
+            binary = cv2.threshold(roi_mask,
+                127,
+                255,
+                cv2.THRESH_BINARY
+            )[1]
+
+            contours, _ = cv2.findContours(
+                binary,
+                cv2.RETR_EXTERNAL,
+                cv2.CHAIN_APPROX_SIMPLE
+            )
+
+            if len(contours) == 0:
+                return None
+
+            char_imgs = []
+            contours = sorted(
+                contours,
+                key=lambda c: cv2.boundingRect(c)[0]
+            )
+
+            for c in contours:
+                x, y, w, h = cv2.boundingRect(c)
+
+                if w < 5 or h < 5:
+                    continue
+
+                char = binary[
+                    y:y+h,
+                    x:x+w
+                ]
+
+                char = cv2.resize(char, (64, 64))
+                char_imgs.append(char)
+
+            if len(char_imgs) == 0:
+                return None
+
+            merged = np.zeros(
+                (64, 64),
+                dtype=np.float32
+            )
+
+            count = 0
+
+            for char in char_imgs[:12]:
+                merged += (
+                    char.astype(np.float32) / 255.0
+                )
+
+                count += 1
+
+            merged /= max(count, 1)
+            edges = cv2.Canny(
+                (merged * 255).astype(np.uint8),
+                100,
+                200
+            )
+
+            features = {
+                "merged": merged,
+                "edges": edges,
+                "density": float(np.mean(merged)),
+                "edge_density": float(
+                    np.mean(edges) / 255.0
+                )
+            }
+            
+            return features
+
+        except Exception as e:
+            print("[LOG] 자소 특징 추출 실패")
+            print(e)
+
+            return None
+        
+    def _compare_jaso_features(self, a, b):
+        try:
+            density_diff = abs(
+                a["density"] -
+                b["density"]
+            )
+
+            edge_diff = abs(
+                a["edge_density"] -
+                b["edge_density"]
+            )
+
+            merged_diff = np.mean(
+                np.abs(
+                    a["merged"] -
+                    b["merged"]
+                )
+            )
+
+            edge_img_diff = np.mean(
+                np.abs(
+                    a["edges"].astype(np.float32) -
+                    b["edges"].astype(np.float32)
+                )
+            ) / 255.0
+
+            score = 1.0 - (
+                density_diff * 0.2 +
+                edge_diff * 0.2 +
+                merged_diff * 0.35 +
+                edge_img_diff * 0.25
+            )
+
+            return float(score)
+
+        except Exception as e:
+            print("[LOG] 자소 특징 비교 실패")
+            print(e)
+
+            return 0.0
+
+    def analyze_user_styles(
+        self,
+        original_paths,
+        edited_paths,
+        preset_name
+    ):
+        all_thresholds = []
+        all_silence_tolerances = []
+        all_padding_i = []
+        all_padding_o = []
+
+        event_specific_settings = {
+            "Sigh": {"padding_i": 0.3, "padding_o": 0.5, "threshold": 0.0031},
+            "Laughter": {"padding_i": 0.5, "padding_o": 0.7, "threshold": 0.0052},
+            "Gasp": {"padding_i": 0.25, "padding_o": 0.45, "threshold": 0.0028},
+            "Cough": {"padding_i": 0.35, "padding_o": 0.55, "threshold": 0.0035},
+            "Snicker": {"padding_i": 0.4, "padding_o": 0.6, "threshold": 0.0040},
+            "Whispering": {"padding_i": 0.2, "padding_o": 0.4, "threshold": 0.0022}
         }
-        collected_metrics["Default"] = {"thresholds": [], "paddings_i": [], "paddings_o": []}
+        font_features = []
 
         if self.stt_model is None:
             print("[LOG] Whisper 모델 로드 중...")
-            device = "cuda" if torch.cuda.is_available() else "cpu"
+            device = self.device
             compute_type = "float16" if device == "cuda" else "int8"
             try:
                 self.stt_model = WhisperModel("base", device=device, compute_type=compute_type)
             except Exception as e:
+                print(f"[ERROR] {e}")
                 self.stt_model = WhisperModel("base", device="cpu", compute_type="int8")
 
         for orig_path, edit_path in zip(original_paths, edited_paths):
-            print(f"[LOG] 대조 스타일 분석 시작: {os.path.basename(orig_path)} <-> {os.path.basename(edit_path)}")
-            
+            print(f"[LOG] 대조 분석 시작: {os.path.basename(orig_path)} <-> {os.path.basename(edit_path)}")
+
             orig_audio = self._get_audio_data(orig_path)
             edit_audio = self._get_audio_data(edit_path)
+
             if orig_audio is None or edit_audio is None:
+                print(f"[LOG] 오디오 추출 실패: {edit_path}")
                 continue
 
-            correlation = np.correlate(orig_audio[::1600], edit_audio[::1600], mode='valid')
-            offset_seconds = np.argmax(correlation) / 10.0
-            
-            segments, _ = self.stt_model.transcribe(orig_path)
-            all_segments = list(segments)
-            
-            for s in all_segments:
-                s_start_idx = int(s.start * self.sample_rate)
-                s_end_idx = int(s.end * self.sample_rate)
-                orig_segment_audio = orig_audio[s_start_idx:s_end_idx]
-                
-                detected_event = "Default"
-                if self.sed_model is not None and len(orig_segment_audio) > int(0.2 * self.sample_rate):
-                    try:
-                        clip_output, _ = self.sed_model.inference(orig_segment_audio[None, :])
-                        top_indices = np.argsort(clip_output[0])[::-1][:5]
-                        for idx in top_indices:
-                            ev_name = label_map.get(idx, "Unknown")
-                            if ev_name in self.interest_events and clip_output[0][idx] > 0.15:
-                                detected_event = ev_name
-                                break 
-                    except:
-                        pass
+            abs_orig = np.abs(orig_audio)
+            abs_edit = np.abs(edit_audio)
+            orig_avg = np.mean(abs_orig)
+            speech_parts = abs_edit[abs_edit > (orig_avg * 0.3)]
 
-                mapped_start = s.start - offset_seconds
-                mapped_end = s.end - offset_seconds
+            user_threshold = np.percentile(speech_parts, 3) if len(speech_parts) > 0 else 0.08
+            all_thresholds.append(user_threshold)
+
+            correlation = np.correlate(abs_orig[::1600], abs_edit[::1600], mode='valid')
+            offset_idx = np.argmax(correlation)
+            print(f"[LOG] 추정 오프셋: {offset_idx / 10.0:.2f}초")
+
+            energy = float(np.mean(abs_edit))
+            event_name = self._detect_main_event(energy)
+
+            dynamic_padding_i = round(0.25 + energy * 12.0, 3)
+            dynamic_padding_o = round(0.45 + energy * 15.0, 3)
+            dynamic_threshold = round(float(user_threshold), 5)
+
+            event_specific_settings[event_name] = {
+                "padding_i": dynamic_padding_i,
+                "padding_o": dynamic_padding_o,
+                "threshold": dynamic_threshold
+            }
+
+            all_padding_i.append(dynamic_padding_i)
+            all_padding_o.append(dynamic_padding_o)
+            all_silence_tolerances.append(30)
+
+            cap = cv2.VideoCapture(edit_path)
+            if not cap.isOpened():
+                continue
+
+            total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            sample_positions = np.linspace(0, max(0, total_frames - 1), 20).astype(np.int32)
+
+            for pos in sample_positions:
+                cap.set(cv2.CAP_PROP_POS_FRAMES, int(pos))
+                ret, frame = cap.read()
+                if not ret:
+                    continue
                 
-                search_margin = 1.5 
-                search_start = max(0, mapped_start - search_margin)
-                search_end = min(len(edit_audio) / self.sample_rate, mapped_end + search_margin)
-                
-                search_start_idx = int(search_start * self.sample_rate)
-                search_end_idx = int(search_end * self.sample_rate)
-                edit_search_zone = edit_audio[search_start_idx:search_end_idx]
-                
-                if len(edit_search_zone) > int(0.1 * self.sample_rate):
-                    rms_profile = np.array([
-                        np.sqrt(np.mean(edit_search_zone[max(0, j-160):j+160]**2)) 
-                        for j in range(0, len(edit_search_zone), 160)
-                    ])
-                    
-                    noise_floor = np.percentile(rms_profile, 15) if len(rms_profile) > 0 else 0.001
-                    active_indices = np.where(rms_profile > (noise_floor * 2.0))[0]
-                    
-                    if len(active_indices) > 0:
-                        actual_start_sec = search_start + (active_indices[0] * 160 / self.sample_rate)
-                        actual_end_sec = search_start + (active_indices[-1] * 160 / self.sample_rate)
-                        
-                        calc_padding_i = max(0.05, round(mapped_start - actual_start_sec, 2))
-                        calc_padding_o = max(0.05, round(actual_end_sec - mapped_end, 2))
-                        
-                        if calc_padding_i > search_margin: calc_padding_i = 0.4
-                        if calc_padding_o > search_margin: calc_padding_o = 0.6
-                        
-                        actual_speech_signal = edit_search_zone[int(max(0, actual_start_sec - search_start)*self.sample_rate):int(min(len(edit_search_zone)/self.sample_rate, actual_end_sec - search_start)*self.sample_rate)]
-                        if len(actual_speech_signal) > 0:
-                            calc_threshold = float(np.percentile(np.abs(actual_speech_signal), 5))
-                            if calc_threshold < 0.0005: calc_threshold = 0.00427
-                        else:
-                            calc_threshold = 0.00427
-                        
-                        collected_metrics[detected_event]["thresholds"].append(calc_threshold)
-                        collected_metrics[detected_event]["paddings_i"].append(calc_padding_i)
-                        collected_metrics[detected_event]["paddings_o"].append(calc_padding_o)
+                roi, roi_mask = self._extract_subtitle_roi(frame)
+                if roi_mask is None:
+                    continue
+
+                text = "가나다ABC123"
+                best_font, best_score = self._match_font(
+                    roi_mask, 
+                    None,  
+                    text, 
+                    event_name
+                )
+
+                current_density = np.count_nonzero(roi_mask) / (roi_mask.size + 1e-6)
+                stroke_width = max(1.0, current_density * 18.0)
+
+                font_features.append({
+                    "font": best_font,
+                    "score": float(best_score),
+                    "stroke": float(stroke_width),
+                    "density": float(current_density),
+                    "event": event_name
+                })
+            cap.release()
+
+        if len(all_thresholds) == 0:
+            print("[LOG] 유효한 분석 데이터가 없어 프리셋 생성 실패")
+            return None
+
+        valid_features = [f for f in font_features if isinstance(f, dict)]
+
+        if len(valid_features) > 0:
+            font_counter = {}
+            for f in valid_features:
+                fname = f["font"]
+                font_counter[fname] = font_counter.get(fname, 0) + 1
+
+            detected_font = max(font_counter, key=font_counter.get)
+            avg_stroke = np.mean([f["stroke"] for f in valid_features])
+            avg_density = np.mean([f["density"] for f in valid_features])
+        else:
+            detected_font = "NanumGothic_Bold"
+            avg_stroke = 2.0
+            avg_density = 0.5
+
+        if avg_stroke >= 6.0: base_weight_offset = 800.0
+        elif avg_stroke >= 4.0: base_weight_offset = 650.0
+        elif avg_stroke >= 2.5: base_weight_offset = 520.0
+        else: base_weight_offset = 350.0
+
+        size_multiplier = round(1.0 + (avg_density * 1.8), 2)
+        mapped_domains = [self.domain_map.get(d, d) for d in self.domains]
 
         preset_data = {
-            "max_silence_frames": 30,
-            "use_sed": True,
+            "threshold": round(float(np.mean(all_thresholds)) * 0.85, 5),
+            "padding_i": round(float(np.mean(all_padding_i)), 3),
+            "padding_o": round(float(np.mean(all_padding_o)), 3),
+            "max_silence_frames": int(np.mean(all_silence_tolerances)),
             "use_whisper": True,
+            "use_sed": True,
             "interest_events": self.interest_events,
-            "event_specific_settings": {}
+            "event_specific_settings": event_specific_settings,
+            "style_config": {
+                "preset_meta": {
+                    "preset_id": f"{'_'.join(mapped_domains).lower()}_001",
+                    "domain": mapped_domains
+                },
+                "default_base_style": {
+                    "target_font": detected_font,
+                    "color_hex": "#e9e9e9",
+                    "base_size_multiplier": float(size_multiplier),
+                    "base_weight_offset": float(base_weight_offset),
+                    "alignment": "bottom_center"
+                },
+                "layout_rules": {
+                    "max_chars_per_line": 20,
+                    "vertical_offset_percent": 10,
+                    "line_height_multiplier": 1.2
+                },
+                "style_rules": []
+            }
         }
 
-        for event in self.interest_events:
-            metrics = collected_metrics[event]
-            if metrics["thresholds"]: 
-                preset_data["event_specific_settings"][event] = {
-                    "threshold": round(float(np.mean(metrics["thresholds"])), 5),
-                    "padding_i": round(float(np.mean(metrics["paddings_i"])), 2),
-                    "padding_o": round(float(np.mean(metrics["paddings_o"])), 2)
-                }
-            else: 
-                seed_map = {
-                    "Cough": (0.35, 0.55, 0.0035), "Gasp": (0.25, 0.45, 0.0028),
-                    "Laughter": (0.50, 0.70, 0.0052), "Sigh": (0.30, 0.50, 0.0031),
-                    "Snicker": (0.40, 0.60, 0.0040), "Whispering": (0.20, 0.40, 0.0022)
-                }
-                pi, po, th = seed_map.get(event, (0.4, 0.6, 0.00427))
-                preset_data["event_specific_settings"][event] = {
-                    "threshold": th, "padding_i": pi, "padding_o": po
-                }
-
-        default_metrics = collected_metrics["Default"]
-        preset_data["threshold"] = round(float(np.mean(default_metrics["thresholds"])), 5) if default_metrics["thresholds"] else 0.00427
-        preset_data["padding_i"] = round(float(np.mean(default_metrics["paddings_i"])), 2) if default_metrics["paddings_i"] else 0.4
-        preset_data["padding_o"] = round(float(np.mean(default_metrics["paddings_o"])), 2) if default_metrics["paddings_o"] else 0.6
-
         self.pm.save_preset(preset_name, preset_data)
-        print(f"[LOG] 사운드 분류 학습 기반 맞춤형 프리셋 생성 완료: {preset_name}")
+        print(f"[LOG] 분석 완료 및 프리셋 저장: {preset_name}")
+        print(f"[LOG] 감지 폰트: {detected_font}")
+        print(f"[LOG] 평균 Stroke: {avg_stroke:.2f}")
+
         return preset_data
 
 class CutEngine:
