@@ -11,7 +11,7 @@ pip install -r requirements.txt
 python -m pip install torch==2.1.0 torchaudio==2.1.0 torchvision --index-url https://download.pytorch.org/whl/cu121
 ```
 
-## PANNs (Audio Tagging) 모델: 소리 이벤트를 감지하는 데 사용됩니다.
+## PANNs (Audio Tagging) 모델
 
 가중치(Cnn14): https://zenodo.org/record/3987831/files/Cnn14_mAP%3D0.431.pth?download=1
 
