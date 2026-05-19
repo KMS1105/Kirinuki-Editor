@@ -626,9 +626,15 @@ class CutEngine:
         return merged
 
     def process_video(self, input_path, preset_name):
-        """전체 파이프라인 실행 및 최종 렌더링"""
         preset_file = preset_name if preset_name.endswith(".json") else preset_name + ".json"
-        preset_data = self.pm.load_preset(preset_file)
+        
+        raw_preset_data = self.pm.load_preset(preset_file)
+    
+        if raw_preset_data and "data" in raw_preset_data and "cut" in raw_preset_data["data"]:
+            preset_data = raw_preset_data["data"]["cut"]
+            print(f"[LOG] 'data' -> 'cut'.")
+        else:
+            preset_data = raw_preset_data
    
         vocal_wav = self._separate_vocals(input_path)
         if not vocal_wav or not os.path.exists(vocal_wav):
